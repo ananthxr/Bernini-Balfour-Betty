@@ -2,3 +2,6 @@ node_modules
 dist
 .env
 .env.local
+
+# Arduino firmware credentials (template: Arduino Code/secrets.example.h)
+Arduino Code/secrets.h
