@@ -31,10 +31,13 @@
 #include <TinyGPSPlus.h>
 #include <SoftwareSerial.h>
 #include <time.h>
+#include <sys/time.h>
+#include <coredecls.h>        // settimeofday_cb - tells us when NTP set the clock
 
 // ============================================================
 //  Credentials live in secrets.h, which is NOT committed to git.
 //  On a fresh checkout: copy secrets.example.h -> secrets.h and fill it in.
+//  secrets.h must sit in this same folder, next to this .ino file.
 // ============================================================
 #include "secrets.h"
 const char* WIFI_SSID     = SECRET_WIFI_SSID;
@@ -74,13 +77,27 @@ const char* DEVICE_ID     = "tracker-01";
 // matters most, and slow rotation produces almost no accel variance - so
 // motion detection alone will never catch it. Orientation is watched
 // independently of movement, in BOTH states.
-#define TILT_CHANGE_DEG    8.0f      // log if roll or pitch moves this much
-#define TILT_MIN_GAP_MS    4000      // but no more often than this
-#define TILT_ALERT_DEG     20.0f     // beyond this is a handling alert
+//
+// The catch: an accelerometer cannot tell gravity from the vehicle speeding
+// up, braking or cornering. Braking at 0.15 g reads as ~8.5 deg of "tilt";
+// a pothole can read as 20+. So a tilt only counts when it:
+//   1. survives smoothing   - short jolts (potholes, bumps) average out
+//   2. HOLDS for a while    - braking and bends end; a real tip stays
+//   3. while driving, is BIG - a truck can't corner at 0.47 g (= 25 deg)
+//                              for 10 s without rolling over, so anything
+//                              that passes this is a real orientation change
+#define TILT_FILTER_ALPHA    0.05f   // smoothing at 20 Hz -> ~1 s time constant
+#define TILT_CHANGE_DEG      8.0f    // PARKED: log if roll or pitch moves this much
+#define TILT_HOLD_PARKED_MS  2000    // ...and it stays moved this long
+#define TILT_MOVING_DEG      25.0f   // MOVING: only changes this big count
+#define TILT_HOLD_MOVING_MS  10000   // ...and only if they last this long
+#define TILT_MIN_GAP_MS      4000    // never log tilt more often than this
+#define TILT_ALERT_DEG       20.0f   // beyond this is a handling alert
 
 // ---------- Upload ----------
 #define BUFFER_SIZE        12
 #define UPLOAD_INTERVAL    30000     // flush at least this often
+#define UPLOAD_RETRY_MS    30000     // after a failure, wait this long before retrying
 #define PRINT_INTERVAL     2000
 
 // ---------- Pins ----------
@@ -122,14 +139,18 @@ float  accelWindow[MOTION_SAMPLES];
 uint8_t accelIdx = 0;
 bool   windowFilled = false;
 float  currentVariance = 0;
-float  currentRoll = 0, currentPitch = 0;   // live orientation, updated at 20 Hz
+float  currentRoll = 0, currentPitch = 0;   // SMOOTHED orientation, updated at 20 Hz
+float  gravX = 0, gravY = 0, gravZ = 0;     // smoothed accel = estimate of gravity
+bool   gravSeeded = false;
+unsigned long tiltOverSince = 0;            // 0 = tilt currently within limits
 unsigned long lastAccelSample = 0;
 unsigned long motionAboveSince = 0;   // 0 = not currently above threshold
 unsigned long motionBelowSince = 0;
 
 // ---------- Logging state ----------
 struct Reading {
-  uint32_t epoch;        // 0 = unknown, server will use now()
+  uint32_t epoch;        // real UTC time (unix seconds); 0 = clock not set yet
+  uint32_t capturedMs;   // millis() at capture - lets us work out epoch later
   double   lat, lng;
   float    roll, pitch, tempC, speed, hdop, heading;
   uint8_t  sats;
@@ -162,11 +183,24 @@ bool ledLit = false;
 // There is no growing sum, so nothing can overflow. And because it never
 // freezes, a container shifted gently (e.g. by crane) without tripping
 // MOVING still shows up at its new spot within a few minutes.
-#define PARK_AVG_WARMUP  100        // fixes (~100 s at 1 Hz)
+#define PARK_AVG_WARMUP  100        // fixes (~1-2 min; NEO-6M reports 1-2 per second)
 double  parkLat = 0, parkLng = 0;
 uint8_t parkSamples = 0;            // counts up to PARK_AVG_WARMUP, then stays
 
 uint32_t uploadOK = 0, uploadFail = 0, droppedRows = 0;
+bool     uploadBackoff = false;     // last upload failed -> wait UPLOAD_RETRY_MS
+
+// ---------- Clock ----------
+// One system clock, set from whichever source is available:
+//   - NTP over WiFi (preferred - kept in sync automatically by the ESP8266)
+//   - GPS time (works with no WiFi, e.g. in a yard or in transit)
+// Once set, the ESP8266 keeps it ticking on its own, so every reading gets
+// a real time at the moment it is captured - even if GPS and WiFi are both
+// lost afterwards.
+#define CLOCK_VALID_AFTER  1600000000UL   // Sep 2020; anything earlier = not set
+#define GPS_CLOCK_RESYNC   600000         // re-sync from GPS every 10 min
+bool          clockFromNtp     = false;
+unsigned long lastGpsClockSync = 0;
 
 // =====================================================
 void setup() {
@@ -188,6 +222,13 @@ void setup() {
   gpsSerial.begin(GPS_BAUD);
   Serial.println(F("[..]   GPS serial started @ 9600"));
 
+  // Start NTP before WiFi. It runs in the background and sets the clock as
+  // soon as WiFi is up - now or whenever WiFi comes back later.
+  // The callback fires on every clock set: from NTP (true) or from our own
+  // GPS sync (false), so we always know where the time came from.
+  settimeofday_cb([](bool fromSntp) { clockFromNtp = fromSntp; });
+  configTime(0, 0, "pool.ntp.org", "time.google.com");   // UTC, no DST
+
   wifiConnect();
   secureClient.setInsecure();          // prototype only - see note in README
   secureClient.setBufferSizes(1024, 1024);
@@ -207,6 +248,7 @@ void loop() {
   // GPS must be fed constantly
   while (gpsSerial.available() > 0) gps.encode(gpsSerial.read());
 
+  syncClockFromGps();  // sets the clock from GPS when NTP is not available
   sampleMotion();      // every 50 ms
   updateMotionState(); // hysteresis
   updateLed();
@@ -244,8 +286,22 @@ void sampleMotion() {
   // Orientation, updated every sample. This is INDEPENDENT of the motion
   // state and of the GPS - a container can be rotated while standing still
   // at one coordinate, and that must be caught.
-  currentRoll  = atan2(ay, az) * 180.0 / PI;
-  currentPitch = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+  //
+  // Smooth the raw accel first. Each new sample only moves the estimate 5%
+  // of the way toward itself, so a 50 ms pothole spike shifts it by ~1/20th
+  // of its size, while a real, lasting tilt comes through fully in ~2-3 s.
+  // We smooth the X/Y/Z vector rather than the angles, so the +/-180 deg
+  // wrap of roll can never smear two far-apart angles together.
+  if (!gravSeeded) {
+    gravX = ax; gravY = ay; gravZ = az;
+    gravSeeded = true;
+  } else {
+    gravX += TILT_FILTER_ALPHA * (ax - gravX);
+    gravY += TILT_FILTER_ALPHA * (ay - gravY);
+    gravZ += TILT_FILTER_ALPHA * (az - gravZ);
+  }
+  currentRoll  = atan2(gravY, gravZ) * 180.0 / PI;
+  currentPitch = atan2(-gravX, sqrt(gravY * gravY + gravZ * gravZ)) * 180.0 / PI;
 
   // Magnitude of the acceleration vector. Stationary ~1.0 g regardless of
   // how the unit is oriented, which is why we use magnitude not raw axes.
@@ -290,6 +346,7 @@ void updateMotionState() {
       haveLastLogged = false;
       lastMovingCheck = 0;
       parkSamples = 0;                  // next park starts a fresh average
+      tiltOverSince = 0;                // tilt rules change - restart the timer
     }
   } else {
     motionAboveSince = 0;
@@ -298,7 +355,9 @@ void updateMotionState() {
     if (motionState == MOVING && now - motionBelowSince >= PARK_CONFIRM_MS) {
       motionState = PARKED;
       Serial.println(F(">>> STATE: MOVING -> PARKED"));
-      // Log the arrival point straight away
+      tiltOverSince = 0;                // tilt rules change - restart the timer
+      // Log the arrival point straight away. Being PARKED now, this also
+      // makes the arrival orientation the new tilt reference.
       captureReading(true);
       lastLogTime = now;
     }
@@ -328,15 +387,28 @@ void checkTiltChange() {
     return;
   }
 
-  if (millis() - lastTiltLog < TILT_MIN_GAP_MS) return;
-
   float dRoll  = fabs(currentRoll  - lastLoggedRoll);
   float dPitch = fabs(currentPitch - lastLoggedPitch);
 
   // Roll wraps at +/-180, so 179 -> -179 is a 2 degree change, not 358
   if (dRoll > 180) dRoll = 360 - dRoll;
 
-  if (dRoll < TILT_CHANGE_DEG && dPitch < TILT_CHANGE_DEG) return;
+  // Parked: no vehicle forces, so the accel reading is trustworthy and a
+  // modest change held briefly is real. Moving: only a big change held for
+  // a long time - braking, hills and bends all fail one test or the other.
+  bool moving = (motionState == MOVING);
+  float         limit = moving ? TILT_MOVING_DEG     : TILT_CHANGE_DEG;
+  unsigned long hold  = moving ? TILT_HOLD_MOVING_MS : TILT_HOLD_PARKED_MS;
+
+  if (dRoll < limit && dPitch < limit) {
+    tiltOverSince = 0;              // back within limits: it was a bump/brake/bend
+    return;
+  }
+
+  // Past the limit - start (or continue) timing how long it stays there
+  if (tiltOverSince == 0) tiltOverSince = millis();
+  if (millis() - tiltOverSince < hold) return;
+  if (millis() - lastTiltLog < TILT_MIN_GAP_MS) return;
 
   bool alert = (fabs(currentRoll)  > TILT_ALERT_DEG ||
                 fabs(currentPitch) > TILT_ALERT_DEG);
@@ -353,7 +425,13 @@ void checkTiltChange() {
 
   // Parked rows carry the averaged position; moving rows carry the live one
   captureReading(motionState == PARKED);
-  lastTiltLog = millis();
+
+  // This orientation is now the reference (captureReading only does this
+  // while parked - see there - so set it explicitly for the moving case)
+  lastLoggedRoll  = currentRoll;
+  lastLoggedPitch = currentPitch;
+  lastTiltLog     = millis();
+  tiltOverSince   = 0;
 
   // A genuine handling event should not wait for the next 30 s flush
   if (alert) flushBuffer();
@@ -455,15 +533,26 @@ void captureReading(bool useAverage) {
   r.tempC  = t;
   r.moving = (motionState == MOVING);
   r.rssi   = WiFi.RSSI();
-  r.epoch  = gpsEpoch();
+  // Stamp the reading NOW, at capture - not when it is uploaded, which can be
+  // minutes or hours later if WiFi is down. If the clock is not set yet,
+  // capturedMs lets flushBuffer() work the real time out afterwards.
+  r.epoch      = clockValid() ? (uint32_t)time(nullptr) : 0;
+  r.capturedMs = millis();
 
-  // Every logged row becomes the new tilt reference, whatever triggered it.
-  // Without this, a heartbeat row would leave the old reference in place and
-  // the next tilt check would re-fire on a change that was already recorded.
-  lastLoggedRoll  = currentRoll;
-  lastLoggedPitch = currentPitch;
-  haveTiltRef     = true;
-  lastTiltLog     = millis();
+  // While PARKED, every logged row becomes the new tilt reference, whatever
+  // triggered it. Without this, a heartbeat row would leave the old reference
+  // in place and the next tilt check would re-fire on a change already recorded.
+  //
+  // While MOVING we do NOT do this: routine route points are logged every
+  // 5-60 s, and one taken mid-bend would make the bend's fake tilt the
+  // reference - then straightening out would look like a tilt change.
+  if (motionState == PARKED) {
+    lastLoggedRoll  = currentRoll;
+    lastLoggedPitch = currentPitch;
+    haveTiltRef     = true;
+    lastTiltLog     = millis();
+    tiltOverSince   = 0;
+  }
 
   if (useAverage && parkSamples > 0) {
     r.lat = parkLat;
@@ -503,15 +592,23 @@ void captureReading(bool useAverage) {
 void flushBuffer() {
   if (bufCount == 0) return;
 
+  // Back off after a failure. loop() calls this on EVERY pass once the
+  // buffer is full, and a tilt alert calls it directly - without this
+  // check, a dead link would be retried thousands of times a second.
+  if (uploadBackoff && millis() - lastUpload < UPLOAD_RETRY_MS) return;
+
+  // Never wait for WiFi here. The ESP8266 reconnects on its own in the
+  // background (setAutoReconnect in wifiConnect), so just skip this attempt.
+  // The old code blocked up to 15 s here, during which the IMU went unread
+  // and motion / tilt went undetected.
   if (WiFi.status() != WL_CONNECTED) {
-    wifiConnect();
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println(F("UPLOAD  WiFi down - keeping rows buffered"));
-      lastUpload = millis();     // back off, do not spin
-      uploadFail++;
-      return;
-    }
+    Serial.println(F("UPLOAD  WiFi down - rows kept, retry in 30 s"));
+    uploadFailed();
+    return;
   }
+
+  // Rows captured before the clock was set can get their real time now
+  backfillTimestamps();
 
   // PostgREST requires EVERY object in a bulk-insert array to carry the
   // SAME set of keys. Omitting a key on some rows gives:
@@ -519,8 +616,9 @@ void flushBuffer() {
   // So every row below emits every key, using null where there is no value.
   //
   // recorded_at is the one exception: it cannot be null (NOT NULL with a
-  // default), so if ANY row in this batch lacks a GPS timestamp we drop the
-  // field from ALL rows and let the server stamp them with now().
+  // default). If ANY row still has no time - only possible if neither GPS
+  // nor NTP has EVER set the clock since boot - we drop the field from ALL
+  // rows and let the server stamp them with now(). Last resort only.
   bool allHaveTime = true;
   for (uint8_t i = 0; i < bufCount; i++) {
     if (buffer[i].epoch == 0) { allHaveTime = false; break; }
@@ -574,8 +672,9 @@ void flushBuffer() {
     Serial.print(F(" rows  (")); Serial.print(uploadOK);
     Serial.print(F(" ok / ")); Serial.print(uploadFail); Serial.println(F(" fail)"));
     bufCount = 0;                       // only clear on success
+    uploadBackoff = false;
   } else {
-    uploadFail++;
+    uploadFailed();
     Serial.print(F("UPLOAD  FAILED HTTP ")); Serial.println(code);
     String resp = http.getString();
     if (resp.length()) { Serial.print(F("        ")); Serial.println(resp); }
@@ -616,7 +715,55 @@ uint32_t gpsEpoch() {
   t.tm_hour = gps.time.hour();
   t.tm_min  = gps.time.minute();
   t.tm_sec  = gps.time.second();
-  return (uint32_t)mktime(&t);     // ESP8266 runs in UTC by default
+  return (uint32_t)mktime(&t);     // TZ is UTC (configTime(0, 0, ...) in setup)
+}
+
+// =====================================================
+//  CLOCK
+// =====================================================
+bool clockValid() {
+  return time(nullptr) > (time_t)CLOCK_VALID_AFTER;
+}
+
+// Set the system clock from GPS time. Needed whenever there is no WiFi
+// (so no NTP) - e.g. booting in a yard or on the road. NTP wins when it is
+// available: it is re-synced automatically, while a NEO-6M that has just
+// started can be a few seconds off until it has downloaded the leap-second
+// table from the satellites (takes up to ~12 min).
+void syncClockFromGps() {
+  if (clockValid() && clockFromNtp) return;                      // NTP has it
+  if (clockValid() && millis() - lastGpsClockSync < GPS_CLOCK_RESYNC) return;
+  if (!gps.time.isUpdated() || gps.time.age() > 500) return;     // fresh only
+
+  uint32_t e = gpsEpoch();          // reads the time, which clears isUpdated()
+  if (e == 0) return;
+
+  struct timeval tv = { (time_t)e, 0 };
+  settimeofday(&tv, nullptr);
+  lastGpsClockSync = millis();
+
+  Serial.print(F("CLOCK   set from GPS: ")); Serial.println(isoTime(e));
+}
+
+// A row captured before the clock was set has epoch 0, but remembers the
+// millis() it was taken at. Once the clock is set we can work back:
+//   real time = now - (how long ago it was captured)
+// e.g. captured at millis 20 000, now millis 80 000 and 14:05:00
+//      -> it happened 60 s ago -> 14:04:00
+void backfillTimestamps() {
+  if (!clockValid()) return;
+  uint32_t      nowEpoch = (uint32_t)time(nullptr);
+  unsigned long nowMs    = millis();
+  for (uint8_t i = 0; i < bufCount; i++) {
+    Reading &r = buffer[i];
+    if (r.epoch == 0) r.epoch = nowEpoch - (nowMs - r.capturedMs) / 1000;
+  }
+}
+
+void uploadFailed() {
+  uploadFail++;
+  uploadBackoff = true;
+  lastUpload = millis();          // starts the UPLOAD_RETRY_MS wait
 }
 
 String isoTime(uint32_t epoch) {
@@ -648,6 +795,7 @@ void updateLed() {
 void wifiConnect() {
   Serial.print(F("[..]   WiFi connecting"));
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);    // after this, the ESP8266 keeps reconnecting by itself
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long start = millis();
@@ -757,8 +905,17 @@ void printStatus() {
   Serial.print(F(" pitch:"));       Serial.print(currentPitch, 1);
   Serial.print(F("  (ref R:"));     Serial.print(lastLoggedRoll, 1);
   Serial.print(F(" P:"));           Serial.print(lastLoggedPitch, 1);
-  Serial.print(F(")  logs at "));   Serial.print(TILT_CHANGE_DEG, 0);
-  Serial.println(F(" deg"));
+  Serial.print(F(")  logs at "));
+  Serial.print(motionState == MOVING ? TILT_MOVING_DEG : TILT_CHANGE_DEG, 0);
+  Serial.print(F(" deg held "));
+  Serial.print((motionState == MOVING ? TILT_HOLD_MOVING_MS : TILT_HOLD_PARKED_MS) / 1000);
+  Serial.print(F(" s"));
+  if (tiltOverSince) {              // show the hold timer counting
+    Serial.print(F("  [over limit "));
+    Serial.print((millis() - tiltOverSince) / 1000.0, 1);
+    Serial.print(F(" s]"));
+  }
+  Serial.println();
 
   Serial.print(F("GPS    "));
   if (gpsUsable()) {
@@ -778,6 +935,14 @@ void printStatus() {
   Serial.print(gps.satellites.isValid() ? gps.satellites.value() : 0);
   Serial.print(F("  hdop:"));
   Serial.println(gps.hdop.isValid() ? gps.hdop.hdop() : 0, 1);
+
+  Serial.print(F("TIME   "));
+  if (clockValid()) {
+    Serial.print(isoTime((uint32_t)time(nullptr)));
+    Serial.println(clockFromNtp ? F("  (from NTP)") : F("  (from GPS)"));
+  } else {
+    Serial.println(F("not set yet - waiting for GPS time or WiFi/NTP"));
+  }
 
   Serial.print(F("BUF    ")); Serial.print(bufCount);
   Serial.print('/'); Serial.print(BUFFER_SIZE);

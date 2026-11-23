@@ -3,5 +3,5 @@ dist
 .env
 .env.local
 
-# Arduino firmware credentials (template: Arduino Code/secrets.example.h)
-Arduino Code/secrets.h
+# Arduino firmware credentials (template: secrets.example.h next to the sketch)
+Arduino Code/**/secrets.h
