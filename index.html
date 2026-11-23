@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0a0a0a" />
+    <title>Bernini</title>
+    <meta name="author" content="Ananth" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <div class="app" id="app" data-mode="live">
+      <header class="hdr">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span class="brand-name">BERNINI</span>
+          <span class="brand-unit mono" id="unitCode">—</span>
+        </div>
+
+        <div class="seg seg-mode" id="modeSeg" role="tablist" aria-label="Mode">
+          <button role="tab" data-mode="live" class="on" aria-selected="true"><i class="live-dot"></i>LIVE</button>
+          <button role="tab" data-mode="history" aria-selected="false">HISTORY</button>
+        </div>
+
+        <div class="hdr-right">
+          <span class="badge badge-demo" id="demoBadge" hidden title="No publishable key in .env — showing simulated data">DEMO DATA</span>
+          <span class="badge badge-stale" id="staleBadge" hidden>STALE</span>
+          <label class="select">
+            <span>DEVICE</span>
+            <select id="deviceSel" aria-label="Device"></select>
+          </label>
+          <div class="rt" id="rtState" data-state="connecting" title="Realtime connection">
+            <i class="dot"></i><span class="rt-label">CONNECTING</span>
+          </div>
+          <div class="clock mono" id="clock">--:--:--</div>
+        </div>
+      </header>
+
+      <section class="hist-bar" id="histBar" hidden>
+        <div class="seg seg-sm" id="rangeSeg">
+          <button data-range="1h">1H</button>
+          <button data-range="24h" class="on">24H</button>
+          <button data-range="7d">7D</button>
+          <button data-range="custom">CUSTOM</button>
+        </div>
+        <form class="custom" id="customForm" hidden>
+          <input type="datetime-local" id="fromInp" aria-label="From" required />
+          <span class="arrow">→</span>
+          <input type="datetime-local" id="toInp" aria-label="To" required />
+          <button type="submit" class="btn">APPLY</button>
+        </form>
+        <div class="hist-meta mono" id="histMeta">—</div>
+        <div class="scrub">
+          <button class="btn btn-icon" id="playBtn" aria-label="Play replay" title="Replay route and attitude">
+            <svg viewBox="0 0 16 16" width="12" height="12"><path class="i-play" d="M4 2.5v11l9-5.5z" fill="currentColor" /><g class="i-pause" fill="currentColor"><rect x="3.5" y="2.5" width="3" height="11" /><rect x="9.5" y="2.5" width="3" height="11" /></g></svg>
+          </button>
+          <input type="range" id="scrub" min="0" max="0" value="0" step="1" aria-label="Timeline" />
+          <span class="scrub-time mono" id="scrubTime">—</span>
+        </div>
+      </section>
+
+      <main class="grid">
+        <section class="panel panel-map">
+          <div class="panel-head">
+            <h2>POSITION</h2>
+            <span class="ph-meta mono" id="mapMeta">—</span>
+            <div class="seg seg-xs" id="tileSeg">
+              <button data-style="dark" class="on">DARK</button>
+              <button data-style="light">LIGHT</button>
+            </div>
+          </div>
+          <div class="map-wrap">
+            <div class="map" id="map"></div>
+            <div class="map-flag" id="mapFlag" hidden>NO GPS FIX</div>
+            <button class="map-follow on" id="followBtn" title="Keep the map centred on the container">FOLLOW</button>
+            <button class="map-snap on" id="snapBtn" aria-pressed="true" title="Snap moving segments to the road network. Sends route coordinates to the OSRM routing service.">SNAP TO ROADS</button>
+            <div class="map-legend" aria-label="Map legend" title="Route = moving readings only (accelerometer motion state). Parked periods are collapsed into one stop. No line across gaps over 5 min.">
+              <span><i class="lg-stop"></i>PARKED · DWELL TIME</span>
+              <span class="lg-match-row"><i class="lg-match"></i>ROAD-MATCHED</span>
+              <span><i class="lg-line"></i>STRAIGHT LINE, NOT ROAD PATH</span>
+              <span class="lg-note">THINNER / FAINTER = WORSE HDOP</span>
+              <span class="lg-legacy" id="lgLegacy" hidden>MOTION ESTIMATED FROM GPS (NO is_moving)</span>
+            </div>
+            <div class="map-readout mono" id="mapReadout">—</div>
+          </div>
+        </section>
+
+        <section class="panel panel-3d">
+          <div class="panel-head">
+            <h2>ATTITUDE</h2>
+            <span class="ph-meta mono" id="poseMeta">LIVE</span>
+            <label class="switch" title="Container follows measured roll and pitch">
+              <input type="checkbox" id="syncTilt" checked />
+              <span class="sw" aria-hidden="true"></span>
+              <span>SYNC TILT</span>
+            </label>
+          </div>
+          <div class="three-wrap">
+            <div class="three-host" id="threeHost"></div>
+            <div class="att" id="att" data-level="none">
+              <div class="att-row"><span class="att-k">ROLL</span><span class="att-v mono" id="attRoll">—</span></div>
+              <div class="att-row"><span class="att-k">PITCH</span><span class="att-v mono" id="attPitch">—</span></div>
+              <div class="att-row att-row-sm"><span class="att-k">HDG</span><span class="att-s mono" id="attHdg">—</span></div>
+              <div class="att-state" id="attState">NO DATA</div>
+            </div>
+            <div class="three-hint">DRAG ROTATE · SCROLL ZOOM · DBL-CLICK RESET · CLICK DOORS</div>
+          </div>
+        </section>
+
+        <section class="cards" id="cards" aria-label="Current status">
+          <div class="stale-banner mono" id="staleBanner" hidden>STALE</div>
+
+          <article class="card card-motion" data-card="motion" data-state="unknown">
+            <div class="card-k">MOTION <span class="chip" id="cMotionSrc" title="From the accelerometer on the device">ACCEL</span></div>
+            <div class="motion-v"><i class="motion-ico" aria-hidden="true"></i><span id="cMotion">—</span></div>
+            <div class="card-sub mono" id="cMotionSub">—</div>
+          </article>
+
+          <article class="card" data-card="tilt">
+            <div class="card-k">TILT <span class="chip" id="cTiltState">—</span></div>
+            <div class="tilt-lines">
+              <div class="tl"><span class="tl-k">R</span><span class="tl-v mono" id="cRoll">—</span><span class="gauge"><i class="g-lim l"></i><i class="g-lim r"></i><i class="g-bar" id="gRoll"></i></span></div>
+              <div class="tl"><span class="tl-k">P</span><span class="tl-v mono" id="cPitch">—</span><span class="gauge"><i class="g-lim l"></i><i class="g-lim r"></i><i class="g-bar" id="gPitch"></i></span></div>
+            </div>
+            <div class="card-sub mono" id="cTiltSub">EVENTS 24H —</div>
+          </article>
+
+          <article class="card" data-card="temp">
+            <div class="card-k">TEMPERATURE <span class="chip" title="IMU internal sensor — reads a few degrees high. Indicative, not calibrated.">IMU</span></div>
+            <div class="card-v mono"><span id="cTemp">—</span><small>°C</small></div>
+            <div class="card-sub mono" id="cHum">RH NO SENSOR</div>
+          </article>
+
+          <article class="card" data-card="gps">
+            <div class="card-k">GPS <span class="chip" id="cGpsQ">—</span></div>
+            <div class="card-v mono" id="cGps">—</div>
+            <div class="sat-bars" id="satBars" aria-hidden="true"></div>
+            <div class="card-sub mono" id="cGpsSub">—</div>
+          </article>
+
+          <article class="card" data-card="speed">
+            <div class="card-k">SPEED</div>
+            <div class="card-v mono"><span id="cSpeed">—</span><small>km/h</small></div>
+            <div class="card-sub mono"><i class="hdg-arrow" id="hdgArrow" aria-hidden="true"></i><span id="cHeading">HDG —</span></div>
+          </article>
+
+          <article class="card" data-card="rssi">
+            <div class="card-k">WIFI SIGNAL</div>
+            <div class="card-v mono"><span id="cRssi">—</span><small>dBm</small></div>
+            <div class="card-sub mono"><span class="bars" id="rssiBars"><i></i><i></i><i></i><i></i></span><span id="cRssiQ">NO DATA</span></div>
+          </article>
+
+          <article class="card" data-card="age">
+            <div class="card-k">LAST SEEN</div>
+            <div class="card-v mono" id="cAge">—</div>
+            <div class="card-sub mono" id="cAgeSub">—</div>
+          </article>
+        </section>
+
+        <section class="panel panel-chart" data-chart="rp">
+          <div class="panel-head">
+            <h2>ROLL / PITCH</h2>
+            <div class="legend">
+              <button data-i="0"><i style="background:#ededed"></i>ROLL</button>
+              <button data-i="1"><i style="background:#8c8c8c"></i>PITCH</button>
+            </div>
+          </div>
+          <div class="chart-box"><canvas></canvas><div class="chart-empty" hidden>NO DATA</div></div>
+        </section>
+
+        <section class="panel panel-chart" data-chart="temp">
+          <div class="panel-head"><h2>TEMPERATURE</h2><span class="ph-meta mono">°C</span></div>
+          <div class="chart-box"><canvas></canvas><div class="chart-empty" hidden>NO DATA</div></div>
+        </section>
+
+        <section class="panel panel-chart" data-chart="speed">
+          <div class="panel-head"><h2>SPEED</h2><span class="ph-meta mono">km/h</span></div>
+          <div class="chart-box"><canvas></canvas><div class="chart-empty" hidden>NO DATA</div></div>
+        </section>
+
+        <section class="panel panel-events" id="eventsPanel" hidden>
+          <div class="panel-head">
+            <h2>TILT EVENTS</h2>
+            <span class="ph-meta mono" id="evMeta">|ROLL| OR |PITCH| &gt; 20°</span>
+            <div class="pager">
+              <button class="btn" id="evPrev" aria-label="Previous page">‹</button>
+              <span class="mono" id="evPage">—</span>
+              <button class="btn" id="evNext" aria-label="Next page">›</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="ev-table">
+              <thead>
+                <tr><th>TIME</th><th class="num">ROLL</th><th class="num">PITCH</th><th class="num">PEAK</th><th>STATE</th><th>LOCATION</th><th>MAP</th><th></th></tr>
+              </thead>
+              <tbody id="evBody"></tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+
+      <footer class="foot">
+        <span>BERNINI · CONTAINER TELEMETRY</span>
+        <span>BUILT BY ANANTH · <a href="mailto:ananthxr@gmail.com">ananthxr@gmail.com</a></span>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
